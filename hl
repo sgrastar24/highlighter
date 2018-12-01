@@ -1,0 +1,394 @@
+#!/usr/bin/perl
+#
+#    名前
+#          hl - ハイライト表示
+#
+#    書式
+#          hl [options] PATTERN FILE...
+#          hl [options] [-e PATTERN | -f FILE] [FILE...]
+#          | hl PATTERN
+#
+#
+#    説明
+#
+#          hl は、FILE で名前を指定された入力ファイル (ファイルが指定
+#          されていない場合は標準入力) を標準出力に書き出します。
+#          そのとき、与えられた PATTERN にマッチする部分の表示属性を
+#          変えて（ハイライトして）目につくようにします。
+#          デフォルトでは、ボールドの赤で表示します。
+#
+#          オプションは、指定する順序が重要です。
+#          --attribute, --fixed, --ignore-case, --line は、これらの後に
+#          与えられたパターンとマッチした文字列を修飾する働きをします。
+#          これらのオプションとパターンの組を順序立てて並べることにより、
+#          複数の種類のハイライト表示をさせることができます。
+#
+#          ある文字列に複数のパターンがマッチする場合、先にマッチした
+#          パターンの属性が優先的に適用されます。
+#          ただし、--line が指定されているパターンだけは優先的に適用されます。
+#
+#          オプション名は、識別可能な範囲で省略が可能です。
+#
+#
+#    オプション
+#
+#          -a, --attribute=<ATTRIBUTE>[,<ATTRIBUTE...>]]
+#                  表示属性・色を指定します。
+#                  指定できる値は bold や underline、red や green などです。
+#                  on_ プレフィックスが付くと背景色の指定となります。
+#                  実際に指定できる値は hl --help で確認できます。
+#                  また、識別ができる範囲で単語を省略することもできます。
+#
+#          -x, --fixed
+#                  この後に与えられたパターンを、正規表現ではなく
+#                  固定文字列として扱います。
+#                  解除するには --nofixed とします。
+#
+#          -w, --word-regexp
+#                  この後に与えられたパターンのマッチを単語単位で検査します。
+#                  解除するには --noword-regexp とします。
+#
+#          -i, --ignore-case
+#                  この後に与えられたパターンのマッチを検査する際、
+#                  大文字と小文字を区別しません。
+#                  解除するには --noignore-case とします。
+#
+#          -l, --line
+#                  マッチした文字列だけでなく、行全体をハイライトします。
+#
+#          -e, --regexp=PATTERN
+#                  PATTERN をパターンとして指定します。
+#                  パターンが１つだけの場合、-e は省略できます。
+#
+#          -f, --file=FILE
+#                  パターンを FILEから１行ごとに読み込みます。
+#
+#          -g, --grep
+#                  パターンにマッチした行だけを表示します。
+#                  これは grep --color のような動作をします。
+#
+#          -h, --help
+#                  使用方法を表示します。
+#
+#    注意
+#          実際に表示できる表示属性や色は、使用している端末に依存します。
+#
+#    ヒント
+#          出力を less で見る場合は -R オプションを使うと良いでしょう。
+#
+#    著者
+#          Tokikazu Ohya <toki.ohya@gmail.com>
+#
+#    履歴
+#          V0.1 --- 2005/07/15  非公開
+#
+#          V1.0 --- 2006/05/29  --grep, --word-regexp 追加.
+#
+#    その他
+#          CPANに、同名で同様の機能を持つスクリプトが公開されている
+#          ことが判明。
+#          全くの偶然（というか誰でも思いつく程度のものということか）で
+#          あり、決してアイデアのパクリではありません。
+#          それに開発時期はこちらのほうが先だと思います :-P
+#
+
+use Getopt::Long qw(:config bundling);
+use Term::ANSIColor qw(color colored);
+use Text::Abbrev;
+
+# 自コマンド名からディレクトリ名を取り除く
+$0 =~ s#.*/##;
+
+# 属性定義
+my @attributes = qw( 
+    bold
+    dark
+    underline
+    blink
+    reverse
+    concealed );
+
+# 前景色定義
+my @colors_fg = qw(
+    black
+    red
+    green
+    yellow
+    blue
+    magenta
+    cyan
+    white );
+
+# 背景色定義
+#   前景色名にプレフィックス on_ を付けたもの
+my @colors_bg = map { on_ . $_ } @colors_fg;
+
+my @valid_attributes = ( @attributes, @colors_fg, @colors_bg );
+my %valid_attr_abbrev = abbrev @valid_attributes; # 短縮名取得
+
+#
+# default settings
+#
+my @arg_attr   = ('bold', 'red');
+my $arg_regexp = '';
+my $arg_fix    = 0;
+my $arg_word   = 0;
+my $arg_ignore = 0;
+my $arg_grep   = 0;
+my $arg_line   = 0;
+my $arg_usage  = 0;
+
+#
+# parse options
+#
+my @pattern_array;
+
+$result = GetOptions(
+  'attribute|a=s'   => \&set_attr,
+  'file|f=s'        => \&set_file,
+  'regexp|e=s'      => \&set_regexp,
+  'fixed|x!'        => \$arg_fix,
+  'word-regexp|w!'  => \$arg_word,
+  'ignore-case|i!'  => \$arg_ignore,
+  'grep|g'          => \$arg_grep,
+  'line|l!'         => \$arg_line,
+  'help|h'          => \$arg_usage
+);
+
+# --regexpオプションでパターンが指定されなかった場合
+unless (@pattern_array) {
+  # 引数が残っていない時はエラー
+  if (@ARGV == 0) {
+    $result = 0;
+  }
+  # そうでなければ、最初の引数をパターンとする
+  else {
+    &set_regexp( 'regexp', shift @ARGV );
+  }
+}
+
+# スクリプトの呼び出し方法が正しくなければ、使用法を表示して終了
+if (!$result || $arg_usage) {
+  print grep(s/CMDNAME/$0/ || 1, <DATA>);
+  print "\nAttributes are:\n";
+  print "    @attributes\n";
+  print "    @colors_fg\n";
+  print "    @colors_bg\n";
+  print "\n";
+  exit 1;
+}
+
+#
+# main routine
+#
+my $cur_str;        # 検査対象の文字列
+my $cur_len;        # 検索対象文字列の長さ
+my $cur_pos = 0;    # 検索位置
+
+my $match_head = 0; # マッチ文字列の先頭
+my $match_tail = 0; # マッチ文字列の末尾
+my $match_flag = 0; # マッチ有無
+
+# シグナルハンドラのセットアップ
+#   属性切り替え中に割り込まれた時に、属性を元に戻す
+&signal_setup;
+
+# 出力のバッファリングを無効化
+$| = 1;
+
+# 入力ファイルを１行ずつ処理する
+while (my $cur_str = <>) {
+  chop $cur_str;
+  $cur_len = length($cur_str);
+  $cur_pos = 0;
+
+# 検索処理
+NEXT_MATCH:
+  $match_flag = 0;
+  $match_len = 0;
+
+  # 検索位置が文字列の末尾まで到達した場合
+  if ($cur_pos == $cur_len) {
+    # 改行を出力して次の行の処理に移る
+    print "\n";
+    next;
+  }
+
+  $match_tail = 0;
+  $match_head = $cur_len + 1;
+
+  # 全パターンを使って、マッチするものがあるか調べる
+  foreach $pattern (@pattern_array) {
+
+    # 先頭から検査する
+    pos $cur_str = $cur_pos;
+
+    # マッチ？
+    if ($cur_str =~ /$$pattern{Re}/g) {
+
+      $match_flag = 1;
+      $len = length($&);
+      $pos_e = pos $cur_str;
+      $pos_s = $pos_e - $len;
+
+      # マッチしたパターンにlineオプションが付いている時は、すぐ表示に移る
+      if ($$pattern{Whole}) {
+        $cur_pattern = $pattern;
+        last;
+      }
+      # 最も先頭に近い位置でマッチしたパターンを優先する
+      elsif ($pos_s < $match_head) {
+        $match_len  = $len;
+        $match_head = $pos_s;
+        $match_tail = $pos_e;
+        $cur_pattern = $pattern;
+      }
+    }
+  }
+
+  # マッチしたパターンがあるか？
+  if ($match_flag) {
+
+    # lineオプションが付いたパターンの場合
+    if ($$cur_pattern{Whole}) {
+
+      # 行全体をハイライト表示する
+#chop($cur_str);
+      print colored( $cur_str, $$cur_pattern{Attr} );
+      print "\n";
+
+      # 次の入力行の処理に移る
+      next;
+    }
+
+    # マッチした部分の長さが０の場合
+    #   e.g.) hl "a*" FILE
+    if ($match_len == 0) {
+
+      # １文字だけ出力
+      print substr( $cur_str, $cur_pos, 1 );
+
+      # 検索位置を進め、再度マッチを行う
+      # これは、例えば文字列"bcdaaabcd"に対するパターン"a*"のように、
+      # マッチ部分の長さが１以上になる可能性があるからである
+      $cur_pos++;
+    }
+
+    # マッチした文字列が存在する場合
+    else {
+
+      # マッチ部分の前の文字列を、通常の属性で出力する
+      print substr( $cur_str, $cur_pos, $match_head - $cur_pos );
+
+      # マッチした部分の文字列を、指定された属性で出力する
+      print colored( substr( $cur_str, $match_head, $match_len ), 
+                     $$cur_pattern{Attr} );
+
+      # 検索位置を、マッチ文字列の直後にセットする
+      $cur_pos = $match_tail;
+
+    }
+    goto NEXT_MATCH;
+  }
+
+  # マッチしなかった場合は、行の残りを表示する。
+  #   --grepの場合、cur_posが0以外ならばマッチした行と判定する
+  print substr( $cur_str, $cur_pos ) . "\n" if (!$arg_grep || $cur_pos);
+}
+
+exit;
+
+
+#
+# subroutines
+#
+
+sub set_attr {
+  local @args = split(/,/,$_[1]);
+  @arg_attr = ();
+
+  foreach $attr (@args) {
+    if ($valid_attr_abbrev{$attr}) {
+      @arg_attr = (@arg_attr, $valid_attr_abbrev{$attr}); 
+      next;
+    }
+    print "$0:ERROR: unknown attribute : $attr\n\n";
+    $arg_usage = 1;
+    die "!FINISH";
+  }
+}
+
+sub set_regexp {
+  if ($arg_fix) {
+    $arg_regexp = quotemeta($_[1]);
+  }
+  else {
+    $arg_regexp = $_[1];
+  }
+
+  if ($arg_ignore) {
+    $arg_regexp = '(?i)' . $arg_regexp;
+  }
+
+  if ($arg_word) {
+    $arg_regexp = '\b' . $arg_regexp . '\b';
+  }
+
+  push( @pattern_array,
+        {
+          Re => $arg_regexp,
+          Attr => join(' ', @arg_attr),
+          Whole => $arg_line
+        }
+      );
+}
+
+sub set_file {
+  unless (open FILE, $_[1]) {
+    $arg_usage = 1;
+    die "!FINISH";
+  }
+
+  foreach (<FILE>) {
+    chop;
+    &set_regexp( '', $_ );
+  }
+}
+
+sub signal_setup {
+  $SIG{HUP} =
+  $SIG{INT} =
+  $SIG{QUIT} =
+  $SIG{KILL} =
+  $SIG{TERM} =
+  $SIG{PIPE} =
+  $SIG{PWR} = \&sig_handler;
+}
+
+sub sig_handler {
+  print color('reset');
+  exit 1;
+}
+
+
+__END__
+Usage: CMDNAME [options] PATTERN FILE...
+       CMDNAME [options] [-e PATTERN | -f FILE] [FILE...]
+       | CMDNAME PATTERN
+  -a, --attribute=<ATTRIBUTE>[,<ATTRIBUTE...>]
+			use ATTRIBUTEs when print matching PATTERN
+			allow the ATTRIBUTEs to be abbreviated to uniqueness
+  -x, --fixed		interpret PATTERN as a fixed string
+  -w, --word-regexp force PATTERN to match only whole words
+  -i, --ignore-case	ignore case distinctions
+  -l, --line		apply the attributes whole line matching PATTERN
+  -e, --regexp=PATTERN	use PATTERN as a regular expression
+  -f, --file=FILE	obtain PATTERN from FILE
+  -g, --grep		show only the line matching PATTERN as 'grep --color'
+  -h, --help		display this help and exit
+
+Default attributes: bold,red
+
+Example:
+  tail -f /var/log/messages | CMDNAME -a red,on_cyan -i error
+  CMDNAME --attribute=green --regexp="-+.*" --attribute=cyan,bold --fixed --file=pattern_list log_file
